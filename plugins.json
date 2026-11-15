@@ -1,0 +1,24 @@
+[
+    {
+        "iconUrl": "https://animevietsub.tv/favicon.ico",
+        "fileHash": "sha256-6a3b70cd6b64c2c1a5d69228761904c6409e57f3ddaf2848b7c04edcda0ab38c",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Elv0nne/anivsub",
+        "fileSize": 111053,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "unknown"
+        ],
+        "tvTypes": [
+            "Anime",
+            "Cartoon",
+            "Movie"
+        ],
+        "version": 47,
+        "internalName": "AnimeVietsubProvider",
+        "description": "AnimeVietsub - Xem anime vietsub",
+        "url": "https://raw.githubusercontent.com/Elv0nne/anivsub/builds/AnimeVietsubProvider.cs3",
+        "name": "AnimeVietsubProvider"
+    }
+]
