@@ -71,7 +71,7 @@ subprojects {
 
     cloudstream {
         // when running through github workflow, GITHUB_REPOSITORY should contain current repository name
-        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "Elv0nne/animevietsub")
+        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "Elv0nne/uhnimefourseven")
 
         // QUAN TRỌNG: cloudstream Gradle plugin (com.github.recloudstream:gradle) tự
         // tải "cloudstream.jar" (dùng làm compileOnly stub, KHÁC với dependency
@@ -180,4 +180,4 @@ subprojects {
 
 task<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
-}   
+}
