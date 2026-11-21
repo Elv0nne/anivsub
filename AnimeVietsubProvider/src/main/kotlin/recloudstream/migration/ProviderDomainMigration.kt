@@ -3,7 +3,7 @@ package recloudstream.migration
 import android.content.SharedPreferences
 import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.utils.DataStore.getSharedPrefs
+import com.lagradost.cloudstream3.utils.DataStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Collections
@@ -53,7 +53,7 @@ object ProviderDomainMigration {
                 migPrefs.getString(KEY_HOST, null)?.let { knownHosts.add(it) }
                 if (knownHosts.isEmpty()) {
                     // Lần đầu: dò host cũ từ chính dữ liệu đã lưu của provider này
-                    for ((_, v) in ctx.getSharedPrefs().all) {
+                    for ((_, v) in DataStore.getSharedPrefs(ctx).all) {
                         val raw = v as? String ?: continue
                         if (!raw.startsWith("{")) continue
                         val obj = runCatching { JSONObject(raw) }.getOrNull() ?: continue
@@ -64,7 +64,7 @@ object ProviderDomainMigration {
                     }
                 }
                 if (knownHosts.isNotEmpty()) {
-                    val prefs = ctx.getSharedPrefs()
+                    val prefs = DataStore.getSharedPrefs(ctx)
                     val all = prefs.all
                     val editor = prefs.edit()
                     migrateSnapshot(all, editor, api, origin, host, knownHosts, migPrefs)?.invoke()
@@ -75,8 +75,12 @@ object ProviderDomainMigration {
                     .putString(KEY_HOST, host)
                     .apply()
             }
-            runCatching {
-                val prefs = ctx.getSharedPrefs()
+            // HIỆU NĂNG: `prefs.all` sao chép TOÀN BỘ dữ liệu CloudStream (lịch sử, đang xem dở, thư viện:
+            // hàng nghìn mục) và được tính TRƯỚC khi healOrphanedShows kịp thấy cờ "đã chạy rồi". Trước đây
+            // mỗi mục của trang chủ (tải song song, nhiều mục) đều làm một bản sao như vậy dù không còn gì
+            // để sửa. Kiểm tra cờ trước, chỉ lấy snapshot khi thật sự cần.
+            if (!migPrefs.getBoolean(KEY_HEALED, false)) runCatching {
+                val prefs = DataStore.getSharedPrefs(ctx)
                 healOrphanedShows(api, origin, prefs.all, prefs, migPrefs)
             }
         } catch (_: Throwable) {
@@ -91,7 +95,7 @@ object ProviderDomainMigration {
             val newId = cloudStreamId(realUrl, api.mainUrl)
             val guardKey = api.name + "|" + newId
             if (guardKey in repairedShows) return
-            val prefs = ctx.getSharedPrefs()
+            val prefs = DataStore.getSharedPrefs(ctx)
             val all = prefs.all
             val migPrefs = ctx.getSharedPreferences(api.name + "_migrated_prefs", 0)
             val candidates = LinkedHashSet<Int>()
