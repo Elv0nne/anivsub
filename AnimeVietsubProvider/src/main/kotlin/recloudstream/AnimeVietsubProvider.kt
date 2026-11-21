@@ -18,6 +18,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import okhttp3.Headers
 import okhttp3.Interceptor
@@ -40,6 +41,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import recloudstream.migration.ProviderDomainMigration
 import recloudstream.migration.normalizeSiteUrl
+import java.io.IOException
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -58,6 +60,11 @@ import javax.crypto.spec.SecretKeySpec
  * và header lấy đúng từ mã decompile.
  *
  */
+private fun <K : Any, V : Any> ConcurrentHashMap<K, V>.trimTo(max: Int) {
+    val extra = size - max
+    if (extra > 0) keys.take(extra).forEach { remove(it) }
+}
+
 class AnimeVietsubProvider : MainAPI() {
     override var mainUrl = "https://bit.ly/animevietsubtv"
     override var name = "AnimeVietsub"
@@ -93,7 +100,40 @@ class AnimeVietsubProvider : MainAPI() {
         private const val AVS_TS_SYNC = 0x47 // 71, 'G'
         private const val AVS_TS_PACKET = 188
         private const val AVS_TS_SYNC_CHAIN = 8
-        private const val AVS_PROBE_BYTES = 65536L
+        // Chỉ cần đủ để thấy chuỗi TS sau vỏ PNG: AVS_MAX_PREFIX + (AVS_TS_SYNC_CHAIN - 1) * 188 = 5412
+        // byte. Trước đây chờ đủ 64KB mới trả segment cho player, làm chậm byte đầu tiên của MỖI segment
+        // (và copy 64KB mỗi lần) chỉ để đọc ~5KB.
+        private const val AVS_PROBE_BYTES = 8192L
+        private val avsRangeFromStart = Regex("^\\s*bytes\\s*=\\s*0\\s*-")
+        private val avsSegmentHost = Regex("^https?://[^/]*googleusercontent\\.com/", RegexOption.IGNORE_CASE)
+
+        // HIỆU NĂNG: cache HTML ngắn hạn (trang chủ, tìm kiếm, trang phim): quay lại trang trước, mở lại phim,
+        // gõ lại từ khoá hiện ngay, không gọi mạng + qua lớp bypass Cloudflare lần nữa. Lưu CHUỖI html (không
+        // lưu Document vì Document sửa được) và parse lại: rẻ hơn nhiều so với một vòng mạng.
+        private const val HTML_CACHE_TTL_MS = 90_000L
+        private const val HTML_CACHE_MAX = 24
+        private val htmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
+
+        private fun htmlCacheGet(url: String): String? {
+            val hit = htmlCache[url] ?: return null
+            return if (System.currentTimeMillis() - hit.first < HTML_CACHE_TTL_MS) hit.second else null
+        }
+
+        private fun htmlCachePut(url: String, html: String) {
+            // Không cache trang thử thách Cloudflare, trang chuyển hướng bằng JS (nhỏ, chỉ có
+            // window.location.href) hay trang rỗng/quá ngắn. Lưu ý: "challenge-platform" KHÔNG dùng để
+            // loại, vì Cloudflare chèn script đó vào cả trang bình thường.
+            if (html.length < 1500 || html.contains("Just a moment") || html.contains("_cf_chl_opt") ||
+                html.contains("cf-browser-verification") || html.contains("Attention Required! | Cloudflare") ||
+                (html.length < 6000 && html.contains("window.location.href"))
+            ) return
+            if (htmlCache.size >= HTML_CACHE_MAX) {
+                val now = System.currentTimeMillis()
+                htmlCache.entries.removeAll { now - it.value.first >= HTML_CACHE_TTL_MS }
+                if (htmlCache.size >= HTML_CACHE_MAX) htmlCache.clear()
+            }
+            htmlCache[url] = System.currentTimeMillis() to html
+        }
         private const val AVS_MAX_PREFIX = 4096
 
         val decryptedPlaylists = ConcurrentHashMap<String, String>()
@@ -104,6 +144,10 @@ class AnimeVietsubProvider : MainAPI() {
         val cfWarmupUrl = ConcurrentHashMap<String, String>()
         val cfWarmupHash = AtomicReference<String?>(null)
         private var avsStripLoggedOnce = false
+        private val cfWebViewLock = Any()
+        private const val SERVER_TIMEOUT_MS = 30_000L
+        private const val MAX_CACHED_PLAYLISTS = 32
+        private const val MAX_CACHED_KEYS = 64
 
         fun mergeCookies(existing: String, newCookies: List<String>): String {
             val map = linkedMapOf<String, String>()
@@ -153,7 +197,12 @@ class AnimeVietsubProvider : MainAPI() {
     }
 
     /** GET + gộp Set-Cookie + đi theo window.location.href (tối đa 3 lần, nghỉ 300ms). */
-    private suspend fun fetchWithBypass(initialUrl: String, referer: String? = null): Document {
+    private suspend fun fetchWithBypass(
+        initialUrl: String,
+        referer: String? = null,
+        useCache: Boolean = true,
+    ): Document {
+        if (useCache) htmlCacheGet(initialUrl)?.let { return Jsoup.parse(it) }
         val headers = getBypassHeaders(referer).toMutableMap()
         var currentUrl = initialUrl
         var res = app.get(currentUrl, headers = headers)
@@ -175,6 +224,7 @@ class AnimeVietsubProvider : MainAPI() {
                 headers["Cookie"] = globalCookies
             }
         }
+        if (useCache) htmlCachePut(initialUrl, html)
         return Jsoup.parse(html)
     }
 
@@ -484,7 +534,7 @@ class AnimeVietsubProvider : MainAPI() {
             // data không phải JSON -> là URL trang xem phim: lấy server của tập đang active
             try {
                 val realData = normalizeSiteUrl(data, base)
-                val doc = fetchWithBypass(realData, base)
+                val doc = fetchWithBypass(realData, base, useCache = false)
                 doc.select("a.btn-episode.active, a.episode-link.active, .list-episode a.active").forEach { el ->
                     val hash = el.attr("data-hash")
                     val id = el.attr("data-id")
@@ -501,7 +551,7 @@ class AnimeVietsubProvider : MainAPI() {
 
         coroutineScope {
             servers.map { target ->
-                async { loadServer(target, base, callback) }
+                async { withTimeoutOrNull(SERVER_TIMEOUT_MS) { loadServer(target, base, callback) } }
             }.awaitAll()
         }
         return true
@@ -523,10 +573,19 @@ class AnimeVietsubProvider : MainAPI() {
             val playTech = json.optString("playTech")
             if (link.isNullOrBlank()) return
 
-            if (playTech == "iframe" && link.contains("googleapiscdn.com")) {
+            if (HydraxExtractor.isHydraxUrl(link)) {
+                // Server Hydrax/Abyss: không có m3u8 thật, đi qua HydraxExtractor + HydraxInterceptor
+                HydraxExtractor.getLinks(
+                    streamUrl = link,
+                    providerName = name,
+                    serverName = target.groupName,
+                    referer = base
+                ).forEach(callback)
+            } else if (playTech == "iframe" && link.contains("googleapiscdn.com")) {
                 val playlist = decryptGoogleApisCdn(link)
                 if (playlist != null) {
                     decryptedPlaylists[playlist.url] = playlist.text
+                    decryptedPlaylists.trimTo(MAX_CACHED_PLAYLISTS)
                     runCatching { cfWarmupUrl[URL(playlist.url).host] = link }
                     runCatching {
                         cfWarmupHash.set(Regex("/playlist/([0-9a-f]+)/").find(playlist.url)?.groupValues?.get(1))
@@ -550,6 +609,8 @@ class AnimeVietsubProvider : MainAPI() {
                     ) { quality = Qualities.Unknown.value }
                 )
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (_: Exception) {
         }
     }
@@ -938,11 +999,39 @@ class AnimeVietsubProvider : MainAPI() {
         return 0
     }
 
+    /** Gọi chain.proceed với retry (lỗi mạng hoặc 5xx) để segment thoáng lỗi không làm player dừng. */
+    private fun proceedWithRetry(chain: Interceptor.Chain, req: Request, retries: Int = 2): Response {
+        var last: IOException? = null
+        for (attempt in 0..retries) {
+            try {
+                val r = chain.proceed(req)
+                if (r.code in 500..599 && attempt < retries) {
+                    r.close()
+                    Thread.sleep(300L * (attempt + 1))
+                    continue
+                }
+                return r
+            } catch (e: IOException) {
+                last = e
+                if (attempt < retries) Thread.sleep(300L * (attempt + 1))
+            }
+        }
+        throw last ?: IOException("proceedWithRetry thất bại")
+    }
+
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
-        val segmentRegex = Regex("^https?://[^/]*googleusercontent\\.com/", RegexOption.IGNORE_CASE)
+        // Link Hydrax/Abyss trỏ về host relay nội bộ -> HydraxInterceptor dịch Range sang giao thức segment-token
+        if (extractorLink.url.contains(HydraxExtractor.RELAY_HOST)) return HydraxInterceptor
+        val segmentRegex = avsSegmentHost
         val provider = this
         return Interceptor { chain ->
-            val request = chain.request()
+            var request = chain.request()
+            // Header "authority"/"Origin" của domain playlist không được gửi sang CDN segment khác domain
+            // (CDN coi là giả mạo và chặn) -> bỏ nếu lệch Host thật. Bài học từ cs347.
+            val authority = request.header("authority")
+            if (authority != null && !authority.equals(request.url.host, ignoreCase = true)) {
+                request = request.newBuilder().removeHeader("authority").removeHeader("Origin").build()
+            }
             val url = request.url.toString()
             val host = request.url.host.lowercase()
 
@@ -956,7 +1045,18 @@ class AnimeVietsubProvider : MainAPI() {
                         if (token.isEmpty()) null
                         else runBlocking { provider.fetchDecryptPlaylist(url, token) }
                     }.getOrNull()
-                    if (text != null) decryptedPlaylists[url] = text
+                    if (text == null) {
+                        // Token hết hạn hoặc lỗi: lấy lại token mới từ trang player rồi giải mã lại
+                        val player = cfWarmupUrl[host]
+                        if (player != null) {
+                            text = runCatching { runBlocking { provider.decryptGoogleApisCdn(player) } }
+                                .getOrNull()?.text
+                        }
+                    }
+                    if (text != null) {
+                        decryptedPlaylists[url] = text
+                        decryptedPlaylists.trimTo(MAX_CACHED_PLAYLISTS)
+                    }
                 }
                 if (!text.isNullOrBlank()) {
                     println("AVS: interceptor trả playlist đã giải mã (${text.length} bytes)")
@@ -973,10 +1073,10 @@ class AnimeVietsubProvider : MainAPI() {
             if (host != "googleapiscdn.com" && !host.endsWith(".googleapiscdn.com")) {
                 if (!segmentRegex.containsMatchIn(url)) return@Interceptor chain.proceed(request)
                 val range = request.header("Range")
-                if (range != null && !Regex("^\\s*bytes\\s*=\\s*0\\s*-").containsMatchIn(range)) {
+                if (range != null && !avsRangeFromStart.containsMatchIn(range)) {
                     return@Interceptor chain.proceed(request)
                 }
-                val response = chain.proceed(request.newBuilder().removeHeader("Range").removeHeader("If-Range").build())
+                val response = provider.proceedWithRetry(chain, request.newBuilder().removeHeader("Range").removeHeader("If-Range").build())
                 val body = response.body ?: return@Interceptor response
                 try {
                     val originalLength = body.contentLength()
@@ -1038,9 +1138,12 @@ class AnimeVietsubProvider : MainAPI() {
                 }
                 direct.close()
                 println("AVS-CF: 403 challenge tại $url → nhờ WebView giải")
-                val bytes = provider.fetchViaWebView(url, host, cfWarmupHash.get())
+                val bytes = synchronized(cfWebViewLock) {
+                    cfGotBytes[url] ?: provider.fetchViaWebView(url, host, cfWarmupHash.get())
+                }
                 if (bytes != null && bytes.isNotEmpty()) {
                     cfGotBytes[url] = bytes
+                    cfGotBytes.trimTo(MAX_CACHED_KEYS)
                     return@Interceptor provider.syntheticBytes(request, bytes)
                 }
                 val solved = cfCookies[host]
