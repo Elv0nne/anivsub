@@ -471,7 +471,6 @@ class AnimeVietsubProvider : MainAPI() {
         val doc = infoDoc ?: watchDoc ?: return null
         return try {
             val meta = extractInfoMeta(doc)
-            val watch = watchDoc ?: doc
             val title = doc.selectFirst("h1.Title, h1, .Title, header h1")?.text()?.trim()
                 ?: doc.selectFirst("meta[property=og:title], meta[name=title]")?.attr("content")
                     ?.substringBefore("|")?.trim()
@@ -1020,7 +1019,7 @@ class AnimeVietsubProvider : MainAPI() {
     /**
      * Cắt "vỏ PNG" đứng trước dữ liệu MPEG-TS của segment. Chỉ cắt khi thật sự thấy PNG + chuỗi sync TS
      * (nên an toàn với ảnh thật). Khác bản trước: (1) không bỏ qua khi server không báo Content-Length,
-     * (2) áp dụng cả khi host segment không khớp googleusercontent.com nhưng Content-Type là image/*
+     * (2) áp dụng cả khi host segment không khớp googleusercontent.com nhưng Content-Type bắt đầu bằng image/
      * hoặc octet-stream, (3) tạo BufferedSource đúng MỘT lần (player gọi source() nhiều lần vẫn đúng).
      */
     private fun stripPngPrefix(response: Response, isSegmentHost: Boolean): Response {
@@ -1169,7 +1168,7 @@ class AnimeVietsubProvider : MainAPI() {
             try {
                 runCatching {
                     val bodyText = direct.body?.string() ?: ""
-                    println(
+                    avsLog(
                         "AVS-CF: ${direct.code} chi tiết — cf-mitigated=${direct.header("cf-mitigated")}, " +
                             "server=${direct.header("Server")}, body=${bodyText.length} bytes"
                     )
