@@ -1,6 +1,7 @@
 package recloudstream
 
 import android.util.Base64
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebView
@@ -63,6 +64,11 @@ import javax.crypto.spec.SecretKeySpec
 private fun <K : Any, V : Any> ConcurrentHashMap<K, V>.trimTo(max: Int) {
     val extra = size - max
     if (extra > 0) keys.take(extra).forEach { remove(it) }
+}
+
+/** Log có tag cố định "AVS" để lọc bằng logcat: adb logcat -s AVS:V */
+private fun avsLog(msg: String) {
+    Log.i("AVS", msg)
 }
 
 class AnimeVietsubProvider : MainAPI() {
@@ -233,6 +239,18 @@ class AnimeVietsubProvider : MainAPI() {
         if (it.startsWith("http")) return it
         if (it.startsWith("//")) return "https:$it"
         return URL(URL(baseUrl), it).toString()
+    }
+
+    // Kiểm tra host Hydrax/Abyss bằng chuỗi thuần, KHÔNG gọi HydraxExtractor: object đó khởi tạo
+    // CloudflareKiller, mà CloudflareKiller xoá toàn bộ cookie WebView khi khởi tạo (làm mất cf_clearance
+    // mà phần giải Cloudflare của AnimeVietsub vừa lấy). Chỉ chạm vào HydraxExtractor khi link đúng là Hydrax.
+    private val hydraxHosts = listOf(
+        "abysscdn.com", "abyssplayer.com", "playhydrax.com", "zplayer.io", "short.ink", "short.icu"
+    )
+
+    private fun isHydraxLink(link: String): Boolean {
+        val host = runCatching { URL(link).host }.getOrNull() ?: return false
+        return hydraxHosts.any { host.contains(it, ignoreCase = true) }
     }
 
     private fun fixUrlWith(url: String?, base: String): String = fixUrl(url, base) ?: ""
@@ -573,7 +591,7 @@ class AnimeVietsubProvider : MainAPI() {
             val playTech = json.optString("playTech")
             if (link.isNullOrBlank()) return
 
-            if (HydraxExtractor.isHydraxUrl(link)) {
+            if (isHydraxLink(link)) {
                 // Server Hydrax/Abyss: không có m3u8 thật, đi qua HydraxExtractor + HydraxInterceptor
                 HydraxExtractor.getLinks(
                     streamUrl = link,
@@ -590,7 +608,7 @@ class AnimeVietsubProvider : MainAPI() {
                     runCatching {
                         cfWarmupHash.set(Regex("/playlist/([0-9a-f]+)/").find(playlist.url)?.groupValues?.get(1))
                     }
-                    println("AVS: emit playlist CDN ${playlist.url.substringBefore("?")} (${playlist.text.length} bytes)")
+                    avsLog("AVS: emit playlist CDN ${playlist.url.substringBefore("?")} (${playlist.text.length} bytes)")
                     callback(
                         newExtractorLink("AnimeVietsub", target.groupName, playlist.url, ExtractorLinkType.M3U8) {
                             quality = Qualities.Unknown.value
@@ -599,7 +617,7 @@ class AnimeVietsubProvider : MainAPI() {
                         }
                     )
                 } else {
-                    println("AVS: không lấy được playlist cho ${target.groupName}")
+                    avsLog("AVS: không lấy được playlist cho ${target.groupName}")
                 }
             } else if (link.startsWith("http")) {
                 callback(
@@ -717,12 +735,12 @@ class AnimeVietsubProvider : MainAPI() {
                 val html = res.text
                 token = extractAvsToken(html)
                 if (token == null) {
-                    println("AVS: player page không có avsToken (lần $attempt, HTTP ${res.code}, html ${html.length} bytes)")
+                    avsLog("AVS: player page không có avsToken (lần $attempt, HTTP ${res.code}, html ${html.length} bytes)")
                 } else {
-                    println("AVS: token ok (lần $attempt, len=${token.length}, html ${html.length} bytes)")
+                    avsLog("AVS: token ok (lần $attempt, len=${token.length}, html ${html.length} bytes)")
                 }
             } catch (e: Exception) {
-                println("AVS: lấy token lần $attempt lỗi: ${e.message}")
+                avsLog("AVS: lấy token lần $attempt lỗi: ${e.message}")
             }
             if (token != null) {
                 try {
@@ -730,7 +748,7 @@ class AnimeVietsubProvider : MainAPI() {
                     val decrypted = fetchDecryptPlaylist(m3u8Url, token, playerUrl)
                     if (!decrypted.isNullOrBlank()) return PlaylistResult(m3u8Url, decrypted)
                 } catch (e: Exception) {
-                    println("AVS: lần $attempt lỗi: ${e.message}")
+                    avsLog("AVS: lần $attempt lỗi: ${e.message}")
                 }
             }
             delay(700)
@@ -744,13 +762,13 @@ class AnimeVietsubProvider : MainAPI() {
         val headers = if (referer != null) mapOf("Referer" to referer) + getBypassHeaders(null) else getBypassHeaders(null)
         val res = app.get(playlistUrl, headers = headers)
         val text = res.text
-        println("AVS: playlist HTTP ${res.code}, ${text.length} bytes")
+        avsLog("AVS: playlist HTTP ${res.code}, ${text.length} bytes")
         val result = processEncryptedM3u8(text, res.okhttpResponse.headers, avsToken)
         if (result.isNullOrBlank()) {
-            println("AVS: decrypt FAILED")
+            avsLog("AVS: decrypt FAILED")
         } else {
             val segs = result.split("\n").count { it.trim().startsWith("http") }
-            println("AVS: decrypt OK, $segs segments")
+            avsLog("AVS: decrypt OK, $segs segments")
         }
         return result
     }
@@ -909,13 +927,13 @@ class AnimeVietsubProvider : MainAPI() {
                 cfUa.set(wv.settings.userAgentString)
                 wv.webChromeClient = WebChromeClient()
                 wv.webViewClient = WebViewClient()
-                println("AVS-CF: UA=${wv.settings.userAgentString}")
+                avsLog("AVS-CF: UA=${wv.settings.userAgentString}")
 
                 // Pha A: warm-up đến khi có cf_clearance
                 var hasCf = false
                 for (w in warmups) {
                     if (hasCf) break
-                    println("AVS-CF: warm-up $w")
+                    avsLog("AVS-CF: warm-up $w")
                     runCatching { wv.loadUrl(w) }
                     var t = 0
                     while (t < 20000) {
@@ -925,7 +943,7 @@ class AnimeVietsubProvider : MainAPI() {
                         hasCf = cookies.contains("cf_clearance")
                         if (hasCf) cfCookies[host] = cookies
                         val title = runCatching { evalJs(wv, "document.title") }.getOrNull()
-                        println("AVS-CF: warm-up ${t / 1000}s cf=$hasCf title=${title?.take(40)}")
+                        avsLog("AVS-CF: warm-up ${t / 1000}s cf=$hasCf title=${title?.take(40)}")
                         if (hasCf) break
                     }
                 }
@@ -935,7 +953,7 @@ class AnimeVietsubProvider : MainAPI() {
                     ",{credentials:'include',cache:'no-store'});const b=new Uint8Array(await r.arrayBuffer());" +
                     "let s='';for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);" +
                     "window.__avsKey=r.status+'|'+btoa(s);}catch(e){window.__avsKey='ERR|'+(e&&e.message||e);}})();0"
-                println("AVS-CF: pha B — loadDataWithBaseURL($origin) để né service worker")
+                avsLog("AVS-CF: pha B — loadDataWithBaseURL($origin) để né service worker")
                 runCatching {
                     wv.loadDataWithBaseURL(
                         "$origin/", "<html><head><meta charset='utf-8'></head><body>avs</body></html>",
@@ -950,18 +968,18 @@ class AnimeVietsubProvider : MainAPI() {
                     delay(1500)
                     val v = runCatching { evalJs(wv, "window.__avsKey||''") }.getOrNull()
                     val value = v?.trim('"') ?: ""
-                    println("AVS-CF: phaB js[$n] -> ${value.take(24)}")
+                    avsLog("AVS-CF: phaB js[$n] -> ${value.take(24)}")
                     if (value.startsWith("200|")) {
                         val decoded = runCatching { Base64.decode(value.substringAfter("|"), 0) }.getOrNull()
                         if (decoded != null && decoded.isNotEmpty()) {
                             result = decoded
-                            println("AVS-CF: OK, ${decoded.size} byte lấy từ WebView (pha B)")
+                            avsLog("AVS-CF: OK, ${decoded.size} byte lấy từ WebView (pha B)")
                         }
                     }
                 }
             }
         } catch (t: Throwable) {
-            println("AVS-CF: lỗi WebView: ${t.javaClass.simpleName} ${t.message}")
+            avsLog("AVS-CF: lỗi WebView: ${t.javaClass.simpleName} ${t.message}")
         } finally {
             runCatching { webView?.destroy() }
         }
@@ -997,6 +1015,56 @@ class AnimeVietsubProvider : MainAPI() {
             i++
         }
         return 0
+    }
+
+    /**
+     * Cắt "vỏ PNG" đứng trước dữ liệu MPEG-TS của segment. Chỉ cắt khi thật sự thấy PNG + chuỗi sync TS
+     * (nên an toàn với ảnh thật). Khác bản trước: (1) không bỏ qua khi server không báo Content-Length,
+     * (2) áp dụng cả khi host segment không khớp googleusercontent.com nhưng Content-Type là image/*
+     * hoặc octet-stream, (3) tạo BufferedSource đúng MỘT lần (player gọi source() nhiều lần vẫn đúng).
+     */
+    private fun stripPngPrefix(response: Response, isSegmentHost: Boolean): Response {
+        val body = response.body ?: return response
+        if (response.code !in 200..299) return response
+        val ct = response.header("Content-Type") ?: ""
+        if (!isSegmentHost && !ct.startsWith("image/", true) && !ct.contains("octet-stream", true)) return response
+        return try {
+            val originalLength = body.contentLength()
+            val prefix = findAvsPngPrefixLength(body)
+            if (prefix <= 0 || (originalLength > 0 && prefix >= originalLength)) return response
+            val payload = if (originalLength > 0) originalLength - prefix else -1L
+            val skipped = object : ForwardingSource(body.source()) {
+                private var remaining = prefix
+                private val skipBuf = Buffer()
+                override fun read(sink: Buffer, byteCount: Long): Long {
+                    while (remaining > 0) {
+                        val n = super.read(skipBuf, minOf(remaining, 8192L))
+                        if (n == -1L) return -1L
+                        remaining -= n
+                        skipBuf.clear()
+                    }
+                    return super.read(sink, byteCount)
+                }
+            }
+            val buffered = skipped.buffer()
+            val newType = if (ct.startsWith("image/", true)) "video/mp2t".toMediaTypeOrNull() else body.contentType()
+            val newBody = object : ResponseBody() {
+                override fun contentType(): MediaType? = newType
+                override fun contentLength(): Long = payload
+                override fun source(): BufferedSource = buffered
+            }
+            if (!avsStripLoggedOnce) {
+                avsStripLoggedOnce = true
+                avsLog("AVS: cắt vỏ PNG $prefix byte, segment ${if (payload > 0) payload else originalLength} byte, host=${response.request.url.host}")
+            }
+            val b = response.newBuilder().removeHeader("Content-Range").removeHeader("Content-Length")
+            if (payload > 0) b.header("Content-Length", payload.toString())
+            if (ct.startsWith("image/", true)) b.header("Content-Type", "video/mp2t")
+            b.body(newBody).build()
+        } catch (e: Exception) {
+            avsLog("AVS: cắt vỏ PNG lỗi: ${e.message}")
+            response
+        }
     }
 
     /** Gọi chain.proceed với retry (lỗi mạng hoặc 5xx) để segment thoáng lỗi không làm player dừng. */
@@ -1059,62 +1127,30 @@ class AnimeVietsubProvider : MainAPI() {
                     }
                 }
                 if (!text.isNullOrBlank()) {
-                    println("AVS: interceptor trả playlist đã giải mã (${text.length} bytes)")
+                    avsLog("AVS: interceptor trả playlist đã giải mã (${text.length} bytes)")
                     return@Interceptor Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
                         .code(200).message("OK")
                         .header("Content-Type", "application/vnd.apple.mpegurl")
                         .body(text.toResponseBody("application/vnd.apple.mpegurl".toMediaTypeOrNull()))
                         .build()
                 }
-                println("AVS: interceptor không có bản giải mã cho $url")
+                avsLog("AVS: interceptor không có bản giải mã cho $url")
             }
 
-            // 2) segment trên googleusercontent.com: cắt vỏ PNG
+            // 2) request tới host khác googleapiscdn.com (segment googleusercontent.com, v.v.): cắt vỏ PNG nếu có
             if (host != "googleapiscdn.com" && !host.endsWith(".googleapiscdn.com")) {
-                if (!segmentRegex.containsMatchIn(url)) return@Interceptor chain.proceed(request)
                 val range = request.header("Range")
-                if (range != null && !avsRangeFromStart.containsMatchIn(range)) {
-                    return@Interceptor chain.proceed(request)
+                val rangeFromStart = range == null || avsRangeFromStart.containsMatchIn(range)
+                if (!rangeFromStart) return@Interceptor chain.proceed(request)
+                val isSegmentHost = segmentRegex.containsMatchIn(url)
+                if (!isSegmentHost) {
+                    val r = chain.proceed(request)
+                    return@Interceptor if (range == null) provider.stripPngPrefix(r, false) else r
                 }
-                val response = provider.proceedWithRetry(chain, request.newBuilder().removeHeader("Range").removeHeader("If-Range").build())
-                val body = response.body ?: return@Interceptor response
-                try {
-                    val originalLength = body.contentLength()
-                    if (originalLength <= 0) return@Interceptor response
-                    val prefix = provider.findAvsPngPrefixLength(body)
-                    if (prefix <= 0 || prefix >= originalLength) return@Interceptor response
-                    val payload = originalLength - prefix
-                    val src: BufferedSource = body.source()
-                    val skipped = object : ForwardingSource(src) {
-                        private var remaining = prefix
-                        private val skipBuf = Buffer()
-                        override fun read(sink: Buffer, byteCount: Long): Long {
-                            while (remaining > 0) {
-                                val n = super.read(skipBuf, minOf(remaining, byteCount))
-                                if (n == -1L) return -1L
-                                remaining -= n
-                                skipBuf.clear()
-                            }
-                            return super.read(sink, byteCount)
-                        }
-                    }
-                    val newBody = object : ResponseBody() {
-                        override fun contentType(): MediaType? = body.contentType()
-                        override fun contentLength(): Long = payload
-                        override fun source(): BufferedSource = (skipped as Source).buffer()
-                    }
-                    if (!avsStripLoggedOnce) {
-                        avsStripLoggedOnce = true
-                        println("AVS: cắt vỏ PNG $prefix byte / segment $payload byte")
-                    }
-                    return@Interceptor response.newBuilder()
-                        .removeHeader("Content-Range").removeHeader("Content-Length")
-                        .header("Content-Length", payload.toString())
-                        .body(newBody).build()
-                } catch (e: Exception) {
-                    println("AVS: cắt vỏ PNG lỗi: ${e.message}")
-                    return@Interceptor response
-                }
+                val response = provider.proceedWithRetry(
+                    chain, request.newBuilder().removeHeader("Range").removeHeader("If-Range").build()
+                )
+                return@Interceptor provider.stripPngPrefix(response, true)
             }
 
             // 3) các request còn lại tới googleapiscdn.com (key, segment...)
@@ -1127,7 +1163,9 @@ class AnimeVietsubProvider : MainAPI() {
                 request.newBuilder().header("Cookie", cookie)
                     .header("User-Agent", cfUa.get() ?: request.header("User-Agent") ?: "").build()
             )
-            if (direct.code != 403 && direct.code != 503) return@Interceptor direct
+            if (direct.code != 403 && direct.code != 503) {
+                return@Interceptor if (request.header("Range") == null) provider.stripPngPrefix(direct, false) else direct
+            }
             try {
                 runCatching {
                     val bodyText = direct.body?.string() ?: ""
@@ -1137,7 +1175,7 @@ class AnimeVietsubProvider : MainAPI() {
                     )
                 }
                 direct.close()
-                println("AVS-CF: 403 challenge tại $url → nhờ WebView giải")
+                avsLog("AVS-CF: 403 challenge tại $url → nhờ WebView giải")
                 val bytes = synchronized(cfWebViewLock) {
                     cfGotBytes[url] ?: provider.fetchViaWebView(url, host, cfWarmupHash.get())
                 }
@@ -1148,7 +1186,7 @@ class AnimeVietsubProvider : MainAPI() {
                 }
                 val solved = cfCookies[host]
                 if (!solved.isNullOrBlank()) {
-                    println("AVS-CF: thử lại OkHttp bằng cf_clearance vừa lấy")
+                    avsLog("AVS-CF: thử lại OkHttp bằng cf_clearance vừa lấy")
                     val retry = chain.proceed(
                         request.newBuilder().header("Cookie", solved)
                             .header("User-Agent", cfUa.get() ?: request.header("User-Agent") ?: "")
@@ -1159,15 +1197,15 @@ class AnimeVietsubProvider : MainAPI() {
                             .header("Sec-Fetch-Site", "same-origin")
                             .build()
                     )
-                    println("AVS-CF: OkHttp+cookie -> HTTP ${retry.code}")
+                    avsLog("AVS-CF: OkHttp+cookie -> HTTP ${retry.code}")
                     if (retry.code != 403 && retry.code != 503) return@Interceptor retry
                     retry.close()
                 }
-                println("AVS-CF: WebView không lấy được key (xem log AVS-CF phía trên)")
+                avsLog("AVS-CF: WebView không lấy được key (xem log AVS-CF phía trên)")
                 cfFailedAt[url] = System.currentTimeMillis()
                 chain.proceed(request)
             } catch (t: Throwable) {
-                println("AVS-CF: lỗi bất ngờ: ${t.javaClass.simpleName} ${t.message}")
+                avsLog("AVS-CF: lỗi bất ngờ: ${t.javaClass.simpleName} ${t.message}")
                 chain.proceed(request)
             }
         }
