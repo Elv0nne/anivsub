@@ -56,7 +56,7 @@ object HydraxExtractor {
     // client HTTP thuần (không giống trình duyệt thật). CloudflareKiller dùng WebView
     // thật để vượt qua challenge này, giống cách mọi request khác trong plugin
     // (Anime47Provider.interceptor) đã làm cho anime47.best.
-    private val cloudflareKiller = CloudflareKiller()
+    private val cloudflareKiller by lazy { CloudflareKiller() }
     private const val FRAGMENT_SIZE = 2097152L // 2 MiB, must match server-side chunking
     const val RELAY_HOST = "hydrax-relay.internal"
 
